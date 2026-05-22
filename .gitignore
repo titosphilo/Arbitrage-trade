@@ -1,7 +1,9 @@
 data/cache/
 data/*.db
+data/*.db
 *.pyc
 __pycache__/
 .env
 *.log
 .DS_Store
+!data/funding_history_166d.csv
