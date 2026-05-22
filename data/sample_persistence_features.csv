@@ -1,0 +1,7 @@
+symbol,rate_volatility,consecutive_positive_periods,oi_change_rate,coin_category,survival_rate
+RAVEUSDT,0.04,90,0.18,sticky_coin,1.00
+BASUSDT,0.05,84,0.12,sticky_coin,1.00
+METAUSDT,0.18,21,0.03,stock_perp,0.64
+COINUSDT,0.41,9,-0.22,stock_perp,0.26
+BTCUSDT,0.12,32,0.05,major_crypto,0.58
+AMZNUSDT,0.20,18,-0.04,stock_perp,0.49

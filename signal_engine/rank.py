@@ -1,56 +1,86 @@
-"""Rank perps by funding APR and composite edge score."""
-import numpy as np
-from dataclasses import dataclass, field
-from config import MIN_FUNDING_APR, ENTER_FUNDING_APR, STRONG_APR
+from dataclasses import dataclass
 
-@dataclass
-class Signal:
-    symbol:            str
-    funding_ann:       float        # annualised funding %
-    basis_ann:         float = 0.0
-    persistence_score: float = 0.0
-    liquidity_score:   float = 0.0
-    crowding_score:    float = 0.0
-    flip_risk:         float = 0.0
-    edge_score:        float = 0.0
-    status:            str   = "NEUTRAL"
-
-    def classify(self) -> "Signal":
-        if   self.funding_ann >= STRONG_APR:       self.status = "ENTER"
-        elif self.funding_ann >= ENTER_FUNDING_APR: self.status = "ENTER"
-        elif self.funding_ann >= MIN_FUNDING_APR:   self.status = "HOLD"
-        elif self.funding_ann > 0:                  self.status = "WATCH"
-        else:                                       self.status = "EXIT"
-        return self
+from signal_engine.persistence import PersistenceClassifier, PersistenceSample
 
 
-def compute_edge_score(s: Signal) -> float:
-    apr_score  = min(s.funding_ann / 2, 50)
-    pers_score = s.persistence_score * 0.25
-    liq_score  = s.liquidity_score   * 0.15
-    flip_pen   = s.flip_risk         * 0.10
-    return max(0, apr_score + pers_score + liq_score - flip_pen)
+@dataclass(frozen=True)
+class EdgeCandidate:
+    symbol: str
+    funding_apr: float
+    rate_volatility: float
+    consecutive_positive_periods: float
+    oi_change_rate: float
+    coin_category: str
+    liquidity_score: float = 1.0
 
 
-def rank_by_apr(signals: list) -> list:
-    return sorted(signals, key=lambda s: -s.funding_ann)
+@dataclass(frozen=True)
+class RankedEdge:
+    symbol: str
+    edge_score: float
+    sticky_probability: float
+    funding_component: float
+    persistence_component: float
+    risk_penalty: float
 
 
-def from_funding_records(records: list) -> list:
-    signals = []
-    for r in records:
-        ann = float(r.get("funding_rate", 0)) * 100 * 3 * 365
-        s = Signal(symbol=r["symbol"], funding_ann=ann)
-        s.edge_score = compute_edge_score(s)
-        s.classify()
-        signals.append(s)
-    return rank_by_apr(signals)
+def compute_edge_score(
+    candidate: EdgeCandidate,
+    persistence_classifier: PersistenceClassifier | None = None,
+    *,
+    sticky_probability: float | None = None,
+) -> RankedEdge:
+    if sticky_probability is None:
+        if persistence_classifier is None:
+            sticky_probability = 0.50
+        else:
+            sticky_probability = persistence_classifier.predict_probability(
+                PersistenceSample(
+                    symbol=candidate.symbol,
+                    rate_volatility=candidate.rate_volatility,
+                    consecutive_positive_periods=candidate.consecutive_positive_periods,
+                    oi_change_rate=candidate.oi_change_rate,
+                    coin_category=candidate.coin_category,
+                    survival_rate=0.0,
+                )
+            )
+
+    funding_component = clamp(candidate.funding_apr / 1.50, 0.0, 1.5)
+    persistence_component = clamp(sticky_probability, 0.0, 1.0)
+    streak_component = clamp(candidate.consecutive_positive_periods / 90, 0.0, 1.0)
+    oi_component = clamp((candidate.oi_change_rate + 0.25) / 0.50, 0.0, 1.0)
+    liquidity_component = clamp(candidate.liquidity_score, 0.0, 1.0)
+    risk_penalty = clamp(candidate.rate_volatility / 0.50, 0.0, 1.0)
+
+    score = (
+        35 * funding_component
+        + 35 * persistence_component
+        + 12 * streak_component
+        + 8 * oi_component
+        + 10 * liquidity_component
+        - 20 * risk_penalty
+    )
+
+    return RankedEdge(
+        symbol=candidate.symbol,
+        edge_score=round(score, 4),
+        sticky_probability=round(sticky_probability, 4),
+        funding_component=round(funding_component, 4),
+        persistence_component=round(persistence_component, 4),
+        risk_penalty=round(risk_penalty, 4),
+    )
 
 
-def estimate_flip_risk(rate_history: list[float]) -> float:
-    """Fraction of sign changes in recent rate history."""
-    if len(rate_history) < 3:
-        return 0.3
-    signs = [1 if r > 0 else -1 for r in rate_history]
-    flips = sum(1 for i in range(1, len(signs)) if signs[i] != signs[i-1])
-    return min(flips / len(signs), 1.0)
+def rank_edges(
+    candidates: list[EdgeCandidate],
+    persistence_classifier: PersistenceClassifier | None = None,
+) -> list[RankedEdge]:
+    ranked = [
+        compute_edge_score(candidate, persistence_classifier)
+        for candidate in candidates
+    ]
+    return sorted(ranked, key=lambda edge: edge.edge_score, reverse=True)
+
+
+def clamp(value: float, lower: float, upper: float) -> float:
+    return min(max(value, lower), upper)

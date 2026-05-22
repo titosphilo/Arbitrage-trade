@@ -1,1 +1,1 @@
-"""Signal engine: rank opportunities by quality, not just headline APR."""
+"""Signal models for ranking arbitrage opportunities."""

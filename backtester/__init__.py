@@ -1,1 +1,1 @@
-"""Backtester: test whether edges survive realistic costs."""
+"""Backtesting modules for arbitrage research."""

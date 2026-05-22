@@ -1,139 +1,228 @@
-"""
-Funding Survival Backtest
-
-Core question: if you entered a position when funding was X%/yr,
-what did the funding actually earn over the next 30 days after:
-  - Rate decay
-  - Adverse price moves
-  - Spread costs
-  - Stop-out events
-
-Data: data/funding_history_166d.csv (46,511 rows, 8h intervals)
-Format: symbol, timestamp (ISO), fundingRate (decimal, e.g. 0.0006 = 0.06%/8h)
-"""
-
-import csv, numpy as np, os, sys
+import argparse
+import csv
+import json
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import FUNDING_HAIRCUT, SPREAD_COST_PCT, ENTER_FUNDING_APR, MIN_FUNDING_APR
-
-DATA_FILE = Path(__file__).parent.parent / "data" / "funding_history_166d.csv"
+from statistics import mean, median
+from typing import Iterable
 
 
-def load_rates(symbol: str) -> list[float]:
-    """Load 8h funding rates for a symbol (as % per period, not decimal)."""
-    rates = []
-    with open(DATA_FILE) as f:
-        for row in csv.DictReader(f):
-            if row['symbol'] == symbol:
-                rates.append(float(row['fundingRate']) * 100)  # to %
-    return rates
+SYMBOL_COLUMNS = ("symbol", "pair", "ticker", "contract")
+TIME_COLUMNS = ("timestamp", "time", "funding_time", "fundingTime", "datetime", "date")
+APR_COLUMNS = ("funding_apr", "apr", "annualized_apr", "annualized_rate")
+RATE_COLUMNS = ("funding_rate", "fundingRate", "rate")
 
 
-def available_symbols() -> list[str]:
-    """List all symbols in the dataset."""
-    seen = set()
-    with open(DATA_FILE) as f:
-        for row in csv.DictReader(f):
-            seen.add(row['symbol'])
-    return sorted(seen)
+@dataclass(frozen=True)
+class FundingPoint:
+    symbol: str
+    timestamp: datetime
+    apr: float
 
 
-def backtest_entry(
-    rates: list[float],
-    entry_idx: int,
-    hold_periods: int = 90,      # 30 days = 90 × 8h
-    stop_threshold: float = -0.005,  # exit if rate < -0.005%/8h
-    notional: float = 100.0,
-) -> dict:
-    """Simulate one position from entry_idx forward."""
-    if entry_idx >= len(rates):
-        return {}
-    entry_rate = rates[entry_idx]
-    income = 0.0
-    periods_held = 0
-    exit_reason = 'time'
+@dataclass(frozen=True)
+class SurvivalTrade:
+    symbol: str
+    entry_time: datetime
+    exit_time: datetime
+    entry_apr: float
+    exit_apr: float
+    survived: bool
 
-    for i in range(entry_idx, min(entry_idx + hold_periods, len(rates))):
-        r = rates[i]
-        if r < stop_threshold:
-            exit_reason = 'rate_flip'
-            break
-        income += notional * r / 100
-        periods_held += 1
 
-    spread_cost = notional * SPREAD_COST_PCT * 2
-    net_income  = income - spread_cost
-    ann_realised = (income / max(periods_held, 1) * 3 * 365) if periods_held > 0 else 0
+def parse_timestamp(value: object) -> datetime:
+    if value is None:
+        raise ValueError("missing timestamp")
+
+    text = str(value).strip()
+    if not text:
+        raise ValueError("missing timestamp")
+
+    if text.isdigit():
+        numeric = int(text)
+        if numeric > 10_000_000_000:
+            numeric = numeric / 1000
+        return datetime.fromtimestamp(numeric, tz=timezone.utc)
+
+    normalized = text.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def parse_float(value: object) -> float:
+    if value is None:
+        raise ValueError("missing numeric value")
+    text = str(value).strip().replace("%", "")
+    number = float(text)
+    if "%" in str(value):
+        return number / 100
+    return number
+
+
+def first_present(row: dict, candidates: Iterable[str]) -> object:
+    for column in candidates:
+        if column in row and row[column] not in (None, ""):
+            return row[column]
+    raise KeyError(f"missing one of: {', '.join(candidates)}")
+
+
+def row_to_point(row: dict, periods_per_year: int = 1095) -> FundingPoint:
+    symbol = str(first_present(row, SYMBOL_COLUMNS)).strip().upper()
+    timestamp = parse_timestamp(first_present(row, TIME_COLUMNS))
+
+    try:
+        apr = parse_float(first_present(row, APR_COLUMNS))
+    except KeyError:
+        funding_rate = parse_float(first_present(row, RATE_COLUMNS))
+        apr = funding_rate * periods_per_year
+
+    return FundingPoint(symbol=symbol, timestamp=timestamp, apr=apr)
+
+
+def load_csv(path: Path) -> list[FundingPoint]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return [row_to_point(row) for row in reader]
+
+
+def load_sqlite(path: Path, table: str | None = None) -> list[FundingPoint]:
+    with sqlite3.connect(path) as connection:
+        selected_table = table or detect_sqlite_table(connection)
+        rows = connection.execute(f'SELECT * FROM "{selected_table}"').fetchall()
+        columns = [description[0] for description in connection.execute(f'SELECT * FROM "{selected_table}" LIMIT 1').description]
+
+    return [row_to_point(dict(zip(columns, row))) for row in rows]
+
+
+def detect_sqlite_table(connection: sqlite3.Connection) -> str:
+    rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+    ).fetchall()
+    if not rows:
+        raise ValueError("SQLite database has no tables")
+    return str(rows[0][0])
+
+
+def load_funding_history(path: str | Path, table: str | None = None) -> list[FundingPoint]:
+    resolved = Path(path)
+    suffix = resolved.suffix.lower()
+
+    if suffix == ".csv":
+        return load_csv(resolved)
+    if suffix in {".db", ".sqlite", ".sqlite3"}:
+        return load_sqlite(resolved, table)
+
+    raise ValueError(f"unsupported funding history format: {resolved.suffix}")
+
+
+def survival_trades(
+    points: Iterable[FundingPoint],
+    entry_threshold_apr: float = 0.40,
+    horizon_days: int = 30,
+) -> list[SurvivalTrade]:
+    by_symbol: dict[str, list[FundingPoint]] = {}
+    for point in points:
+        by_symbol.setdefault(point.symbol, []).append(point)
+
+    trades: list[SurvivalTrade] = []
+    horizon = timedelta(days=horizon_days)
+
+    for symbol, symbol_points in by_symbol.items():
+        ordered = sorted(symbol_points, key=lambda point: point.timestamp)
+        for index, entry in enumerate(ordered):
+            if entry.apr < entry_threshold_apr:
+                continue
+
+            target_time = entry.timestamp + horizon
+            exit_point = next(
+                (
+                    candidate
+                    for candidate in ordered[index + 1 :]
+                    if candidate.timestamp >= target_time
+                ),
+                None,
+            )
+            if exit_point is None:
+                continue
+
+            trades.append(
+                SurvivalTrade(
+                    symbol=symbol,
+                    entry_time=entry.timestamp,
+                    exit_time=exit_point.timestamp,
+                    entry_apr=entry.apr,
+                    exit_apr=exit_point.apr,
+                    survived=exit_point.apr >= entry_threshold_apr,
+                )
+            )
+
+    return trades
+
+
+def summarize(trades: list[SurvivalTrade]) -> dict:
+    if not trades:
+        return {
+            "entries": 0,
+            "survivors": 0,
+            "survival_rate": 0.0,
+            "median_entry_apr": None,
+            "median_exit_apr": None,
+            "mean_exit_apr": None,
+            "symbols": {},
+        }
+
+    survivors = [trade for trade in trades if trade.survived]
+    symbols = sorted({trade.symbol for trade in trades})
 
     return {
-        'entry_rate':    round(entry_rate, 6),
-        'ann_entry':     round(entry_rate * 3 * 365, 1),
-        'periods_held':  periods_held,
-        'days_held':     round(periods_held / 3, 1),
-        'gross_income':  round(income, 4),
-        'spread_cost':   round(spread_cost, 4),
-        'net_income':    round(net_income, 4),
-        'ann_realised':  round(ann_realised, 1),
-        'exit_reason':   exit_reason,
-        'survived':      exit_reason == 'time',
+        "entries": len(trades),
+        "survivors": len(survivors),
+        "survival_rate": round(len(survivors) / len(trades), 4),
+        "median_entry_apr": round(median(trade.entry_apr for trade in trades), 4),
+        "median_exit_apr": round(median(trade.exit_apr for trade in trades), 4),
+        "mean_exit_apr": round(mean(trade.exit_apr for trade in trades), 4),
+        "symbols": {
+            symbol: summarize_symbol([trade for trade in trades if trade.symbol == symbol])
+            for symbol in symbols
+        },
     }
 
 
-def run_backtest(symbol: str, min_entry_apr: float = ENTER_FUNDING_APR) -> dict:
-    """Run all valid entry points for a symbol and aggregate."""
-    rates = load_rates(symbol)
-    if not rates:
-        return {'symbol': symbol, 'n_entries': 0, 'error': 'no data'}
-
-    min_rate_per_period = min_entry_apr / 3 / 365
-    entries = [i for i, r in enumerate(rates)
-               if r >= min_rate_per_period and i + 10 < len(rates)]
-
-    if not entries:
-        return {'symbol': symbol, 'n_entries': 0, 'n_total_periods': len(rates)}
-
-    results = [backtest_entry(rates, i) for i in entries]
-    results = [r for r in results if r]
-
-    survived     = [r for r in results if r.get('survived')]
-    net_incomes  = [r['net_income'] for r in results]
-    ann_realised = [r['ann_realised'] for r in results]
-
+def summarize_symbol(trades: list[SurvivalTrade]) -> dict:
+    survivors = [trade for trade in trades if trade.survived]
     return {
-        'symbol':           symbol,
-        'n_periods':        len(rates),
-        'n_entries':        len(results),
-        'survival_rate':    round(len(survived) / max(len(results), 1), 3),
-        'avg_net_income':   round(float(np.mean(net_incomes)), 4),
-        'avg_ann_realised': round(float(np.mean(ann_realised)), 1),
-        'headline_apr':     round(min_entry_apr, 1),
-        'realised_pct_of_headline': round(
-            float(np.mean(ann_realised)) / min_entry_apr * 100, 1),
-        'p25_net':          round(float(np.percentile(net_incomes, 25)), 4),
-        'p75_net':          round(float(np.percentile(net_incomes, 75)), 4),
-        'flip_count':       len(results) - len(survived),
+        "entries": len(trades),
+        "survivors": len(survivors),
+        "survival_rate": round(len(survivors) / len(trades), 4),
+        "median_exit_apr": round(median(trade.exit_apr for trade in trades), 4),
     }
 
 
-def run_all(symbols: list[str] | None = None, min_apr: float = ENTER_FUNDING_APR) -> list[dict]:
-    if symbols is None:
-        symbols = available_symbols()
-    return [run_backtest(s, min_apr) for s in symbols]
+def run(path: str | Path, table: str | None, threshold: float, horizon_days: int) -> dict:
+    points = load_funding_history(path, table)
+    trades = survival_trades(points, threshold, horizon_days)
+    result = summarize(trades)
+    result["input_rows"] = len(points)
+    result["entry_threshold_apr"] = threshold
+    result["horizon_days"] = horizon_days
+    return result
 
 
-if __name__ == '__main__':
-    targets = ['COINUSDT', 'AMZNUSDT', 'METAUSDT', 'RAVEUSDT',
-               'JELLYJELLYUSDT', 'BASUSDT', 'BTCUSDT', 'ETHUSDT']
-    print(f"\n{'Symbol':22} {'Entries':>8} {'Survival':>9} {'Realised%/yr':>13} {'vs headline':>12} {'Flip':>5}")
-    print('─' * 75)
-    for sym in targets:
-        r = run_backtest(sym)
-        if r.get('n_entries', 0) == 0:
-            print(f"  {sym:20}  no entries above threshold"); continue
-        icon = '✅' if r['survival_rate'] > 0.7 else ('⚠️' if r['survival_rate'] > 0.4 else '❌')
-        print(f"  {icon} {sym:20} {r['n_entries']:>7}  "
-              f"{r['survival_rate']*100:>8.0f}%  "
-              f"{r['avg_ann_realised']:>12.1f}%  "
-              f"{r['realised_pct_of_headline']:>11.0f}%  "
-              f"{r['flip_count']:>4}")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Funding APR survival backtest")
+    parser.add_argument("history_path", help="CSV or SQLite funding history")
+    parser.add_argument("--table", default=None, help="SQLite table name")
+    parser.add_argument("--threshold", type=float, default=0.40, help="Entry/survival APR threshold")
+    parser.add_argument("--horizon-days", type=int, default=30, help="Survival horizon")
+    args = parser.parse_args()
+
+    result = run(args.history_path, args.table, args.threshold, args.horizon_days)
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

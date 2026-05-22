@@ -1,1 +1,1 @@
-"""Arbitrage Trade — research-first funding arbitrage engine."""
+"""Arbitrage research tools."""

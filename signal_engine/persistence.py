@@ -1,119 +1,292 @@
-"""
-Persistence Classifier — dependency-free logistic regression.
-
-Predicts whether a coin's funding rate will stay positive for 30 days.
-Label = 1 if survival_rate > 70%, 0 otherwise.
-
-Features:
-  - rate_volatility           : std of 8h funding rates (lower = more stable)
-  - consecutive_positive_periods: longest run of positive periods
-  - oi_change_rate            : OI trend proxy (positive = growing interest)
-  - coin_category             : sticky_coin / stock_perp / major_crypto / niche_crypto
-
-No scikit-learn required — pure numpy logistic regression.
-"""
-
-import csv, math, numpy as np
+import argparse
+import csv
+import json
+import math
+import random
+from dataclasses import dataclass
 from pathlib import Path
-
-DATA_FILE = Path(__file__).parent.parent / "data" / "persistence_features.csv"
-
-CATEGORY_ENCODE = {
-    'sticky_coin':   [1, 0, 0, 0],
-    'stock_perp':    [0, 1, 0, 0],
-    'major_crypto':  [0, 0, 1, 0],
-    'niche_crypto':  [0, 0, 0, 1],
-}
+from statistics import mean, pstdev
 
 
-def load_features(path=DATA_FILE) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Returns X (n_samples, n_features), y (n_samples,), symbols list."""
-    X, y, syms = [], [], []
-    with open(path) as f:
-        for row in csv.DictReader(f):
-            vol     = float(row['rate_volatility'])
-            consec  = float(row['consecutive_positive_periods'])
-            oi_chg  = float(row['oi_change_rate'])
-            cat     = row['coin_category']
-            surv    = float(row['survival_rate'])
-            label   = 1 if surv > 0.70 else 0
-            cat_enc = CATEGORY_ENCODE.get(cat, [0, 0, 0, 1])
-            X.append([vol, consec / 100.0, oi_chg] + cat_enc)
-            y.append(label)
-            syms.append(row['symbol'])
-    return np.array(X), np.array(y), syms
+CATEGORY_COLUMNS = ("coin_category", "category", "sector", "type")
+SYMBOL_COLUMNS = ("symbol", "pair", "ticker", "contract")
+SURVIVAL_COLUMNS = ("survival_rate", "survival", "thirty_day_survival_rate")
+VOLATILITY_COLUMNS = ("rate_volatility", "funding_rate_volatility", "apr_volatility")
+STREAK_COLUMNS = (
+    "consecutive_positive_periods",
+    "positive_period_streak",
+    "positive_funding_streak",
+)
+OI_CHANGE_COLUMNS = ("oi_change_rate", "open_interest_change_rate", "open_interest_delta")
 
 
-def sigmoid(z):
-    return 1 / (1 + np.exp(-np.clip(z, -500, 500)))
+@dataclass(frozen=True)
+class PersistenceSample:
+    symbol: str
+    rate_volatility: float
+    consecutive_positive_periods: float
+    oi_change_rate: float
+    coin_category: str
+    survival_rate: float
+
+    @property
+    def label(self) -> int:
+        return int(self.survival_rate > 0.70)
 
 
-def train(X, y, lr=0.05, epochs=500) -> np.ndarray:
-    """Train logistic regression with gradient descent."""
-    n_feat = X.shape[1]
-    w = np.zeros(n_feat + 1)          # weights + bias
-    Xb = np.column_stack([np.ones(len(X)), X])
-    for _ in range(epochs):
-        pred = sigmoid(Xb @ w)
-        grad = Xb.T @ (pred - y) / len(y)
-        w   -= lr * grad
-    return w
+@dataclass(frozen=True)
+class PersistencePrediction:
+    symbol: str
+    survival_probability: float
+    predicted_label: int
+    score: float
 
 
-def predict_proba(X, w) -> np.ndarray:
-    Xb = np.column_stack([np.ones(len(X)), X])
-    return sigmoid(Xb @ w)
+def first_present(row: dict, candidates: tuple[str, ...], default: object = None) -> object:
+    for column in candidates:
+        if column in row and row[column] not in (None, ""):
+            return row[column]
+    if default is not None:
+        return default
+    raise KeyError(f"missing one of: {', '.join(candidates)}")
 
 
-def evaluate(y_true, y_pred_proba, threshold=0.5) -> dict:
-    y_pred = (y_pred_proba >= threshold).astype(int)
-    tp = int(np.sum((y_pred == 1) & (y_true == 1)))
-    fp = int(np.sum((y_pred == 1) & (y_true == 0)))
-    tn = int(np.sum((y_pred == 0) & (y_true == 0)))
-    fn = int(np.sum((y_pred == 0) & (y_true == 1)))
-    acc = (tp + tn) / max(len(y_true), 1)
-    prec = tp / max(tp + fp, 1)
-    rec  = tp / max(tp + fn, 1)
-    return dict(accuracy=round(acc,3), precision=round(prec,3),
-                recall=round(rec,3), tp=tp, fp=fp, tn=tn, fn=fn)
+def parse_float(value: object) -> float:
+    text = str(value).strip().replace("%", "")
+    number = float(text)
+    if "%" in str(value):
+        return number / 100
+    return number
 
 
-def score_symbol(features: dict, w: np.ndarray) -> float:
-    """Score a single coin: returns P(sticky)."""
-    vol    = features.get('rate_volatility', 0.1)
-    consec = features.get('consecutive_positive_periods', 0)
-    oi_chg = features.get('oi_change_rate', 0)
-    cat    = features.get('coin_category', 'niche_crypto')
-    cat_enc = CATEGORY_ENCODE.get(cat, [0, 0, 0, 1])
-    x = np.array([[vol, consec / 100.0, oi_chg] + cat_enc])
-    return float(predict_proba(x, w)[0])
+def row_to_sample(row: dict) -> PersistenceSample:
+    return PersistenceSample(
+        symbol=str(first_present(row, SYMBOL_COLUMNS)).strip().upper(),
+        rate_volatility=parse_float(first_present(row, VOLATILITY_COLUMNS)),
+        consecutive_positive_periods=parse_float(first_present(row, STREAK_COLUMNS)),
+        oi_change_rate=parse_float(first_present(row, OI_CHANGE_COLUMNS)),
+        coin_category=str(first_present(row, CATEGORY_COLUMNS, "unknown")).strip().lower(),
+        survival_rate=parse_float(first_present(row, SURVIVAL_COLUMNS)),
+    )
 
 
-def run(path=DATA_FILE):
-    X, y, syms = load_features(path)
-    w = train(X, y)
-    proba = predict_proba(X, w)
-    metrics = evaluate(y, proba)
-
-    feature_names = ['bias','vol','consec/100','oi_chg','sticky','stock','major','niche']
-    print(f"\n  Persistence Classifier — logistic regression (no dependencies)")
-    print(f"  Training samples: {len(y)} ({int(y.sum())} sticky, {int((1-y).sum())} unsticky)")
-    print(f"\n  Accuracy:  {metrics['accuracy']*100:.1f}%")
-    print(f"  Precision: {metrics['precision']*100:.1f}%  (of predicted sticky, how many are)")
-    print(f"  Recall:    {metrics['recall']*100:.1f}%    (of actual sticky, how many found)")
-    print(f"  TP={metrics['tp']} FP={metrics['fp']} TN={metrics['tn']} FN={metrics['fn']}")
-    print(f"\n  Learned weights:")
-    for name, wi in zip(feature_names, w):
-        bar = '█' * int(abs(wi)*3) if abs(wi) < 10 else '█'*10
-        sign = '+' if wi >= 0 else '-'
-        print(f"  {name:12} {wi:>+7.3f}  {sign}{bar}")
-    print(f"\n  Top sticky predictions:")
-    ranked = sorted(zip(syms, proba, y), key=lambda x: -x[1])
-    for sym, p, label in ranked[:10]:
-        tag = '✅ sticky' if label==1 else '❌ unsticky'
-        print(f"  {sym:22} P(sticky)={p:.3f}  actual={tag}")
-    return w, metrics
+def load_samples(path: str | Path) -> list[PersistenceSample]:
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return [row_to_sample(row) for row in reader]
 
 
-if __name__ == '__main__':
-    run()
+class PersistenceClassifier:
+    def __init__(
+        self,
+        weights: list[float],
+        means: list[float],
+        scales: list[float],
+        categories: list[str],
+    ) -> None:
+        self.weights = weights
+        self.means = means
+        self.scales = scales
+        self.categories = categories
+
+    @classmethod
+    def fit(
+        cls,
+        samples: list[PersistenceSample],
+        *,
+        iterations: int = 2_000,
+        learning_rate: float = 0.08,
+        l2: float = 0.01,
+    ) -> "PersistenceClassifier":
+        if not samples:
+            raise ValueError("cannot fit persistence classifier with no samples")
+
+        categories = sorted({sample.coin_category for sample in samples})
+        raw_features = [feature_vector(sample, categories) for sample in samples]
+        means, scales = feature_stats(raw_features)
+        features = [standardize(vector, means, scales) for vector in raw_features]
+        labels = [sample.label for sample in samples]
+        weights = [0.0 for _ in range(len(features[0]) + 1)]
+
+        for _ in range(iterations):
+            gradients = [0.0 for _ in weights]
+            for vector, label in zip(features, labels):
+                predicted = sigmoid(weights[0] + dot(weights[1:], vector))
+                error = predicted - label
+                gradients[0] += error
+                for index, value in enumerate(vector, start=1):
+                    gradients[index] += error * value
+
+            count = len(samples)
+            weights[0] -= learning_rate * gradients[0] / count
+            for index in range(1, len(weights)):
+                regularized = gradients[index] / count + l2 * weights[index]
+                weights[index] -= learning_rate * regularized
+
+        return cls(weights=weights, means=means, scales=scales, categories=categories)
+
+    def predict_probability(self, sample: PersistenceSample) -> float:
+        vector = standardize(feature_vector(sample, self.categories), self.means, self.scales)
+        return sigmoid(self.weights[0] + dot(self.weights[1:], vector))
+
+    def predict(self, sample: PersistenceSample, threshold: float = 0.50) -> PersistencePrediction:
+        probability = self.predict_probability(sample)
+        return PersistencePrediction(
+            symbol=sample.symbol,
+            survival_probability=round(probability, 4),
+            predicted_label=int(probability >= threshold),
+            score=round((probability - 0.5) * 2, 4),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "weights": self.weights,
+            "means": self.means,
+            "scales": self.scales,
+            "categories": self.categories,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "PersistenceClassifier":
+        return cls(
+            weights=[float(value) for value in payload["weights"]],
+            means=[float(value) for value in payload["means"]],
+            scales=[float(value) for value in payload["scales"]],
+            categories=[str(value) for value in payload["categories"]],
+        )
+
+
+def feature_vector(sample: PersistenceSample, categories: list[str]) -> list[float]:
+    category_flags = [1.0 if sample.coin_category == category else 0.0 for category in categories]
+    return [
+        sample.rate_volatility,
+        sample.consecutive_positive_periods,
+        sample.oi_change_rate,
+        *category_flags,
+    ]
+
+
+def feature_stats(vectors: list[list[float]]) -> tuple[list[float], list[float]]:
+    columns = list(zip(*vectors))
+    means = [mean(column) for column in columns]
+    scales = [pstdev(column) or 1.0 for column in columns]
+    return means, scales
+
+
+def standardize(vector: list[float], means: list[float], scales: list[float]) -> list[float]:
+    return [(value - center) / scale for value, center, scale in zip(vector, means, scales)]
+
+
+def sigmoid(value: float) -> float:
+    if value >= 0:
+        z = math.exp(-value)
+        return 1 / (1 + z)
+    z = math.exp(value)
+    return z / (1 + z)
+
+
+def dot(left: list[float], right: list[float]) -> float:
+    return sum(a * b for a, b in zip(left, right))
+
+
+def evaluate(classifier: PersistenceClassifier, samples: list[PersistenceSample]) -> dict:
+    predictions = [classifier.predict(sample) for sample in samples]
+    labels = [sample.label for sample in samples]
+
+    true_positive = sum(
+        1 for prediction, label in zip(predictions, labels) if prediction.predicted_label == 1 and label == 1
+    )
+    true_negative = sum(
+        1 for prediction, label in zip(predictions, labels) if prediction.predicted_label == 0 and label == 0
+    )
+    false_positive = sum(
+        1 for prediction, label in zip(predictions, labels) if prediction.predicted_label == 1 and label == 0
+    )
+    false_negative = sum(
+        1 for prediction, label in zip(predictions, labels) if prediction.predicted_label == 0 and label == 1
+    )
+
+    total = len(samples) or 1
+    precision_denominator = true_positive + false_positive
+    recall_denominator = true_positive + false_negative
+    return {
+        "samples": len(samples),
+        "positive_labels": sum(labels),
+        "negative_labels": len(labels) - sum(labels),
+        "accuracy": round((true_positive + true_negative) / total, 4),
+        "precision": round(true_positive / precision_denominator, 4)
+        if precision_denominator
+        else 0.0,
+        "recall": round(true_positive / recall_denominator, 4)
+        if recall_denominator
+        else 0.0,
+        "true_positive": true_positive,
+        "true_negative": true_negative,
+        "false_positive": false_positive,
+        "false_negative": false_negative,
+    }
+
+
+def train_test_split(
+    samples: list[PersistenceSample],
+    *,
+    test_size: float = 0.20,
+    seed: int = 42,
+) -> tuple[list[PersistenceSample], list[PersistenceSample]]:
+    if not 0 < test_size < 1:
+        raise ValueError("test_size must be between 0 and 1")
+    if len(samples) < 2:
+        raise ValueError("at least two samples are required for holdout validation")
+
+    shuffled = list(samples)
+    random.Random(seed).shuffle(shuffled)
+    test_count = max(1, round(len(shuffled) * test_size))
+    test = shuffled[:test_count]
+    train = shuffled[test_count:]
+    if not train:
+        raise ValueError("holdout split left no training samples")
+    return train, test
+
+
+def train_and_report(
+    path: str | Path,
+    *,
+    holdout: float | None = None,
+    seed: int = 42,
+) -> dict:
+    samples = load_samples(path)
+
+    if holdout is None:
+        train_samples = samples
+        test_samples: list[PersistenceSample] = []
+    else:
+        train_samples, test_samples = train_test_split(samples, test_size=holdout, seed=seed)
+
+    classifier = PersistenceClassifier.fit(train_samples)
+    report = evaluate(classifier, train_samples)
+    report["model"] = classifier.to_dict()
+    report["predictions"] = [
+        classifier.predict(sample).__dict__ | {"actual_label": sample.label}
+        for sample in train_samples
+    ]
+    if test_samples:
+        report["holdout"] = evaluate(classifier, test_samples)
+        report["holdout"]["predictions"] = [
+            classifier.predict(sample).__dict__ | {"actual_label": sample.label}
+            for sample in test_samples
+        ]
+    return report
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train funding persistence classifier")
+    parser.add_argument("features_path", help="CSV with survival_rate and persistence features")
+    parser.add_argument("--holdout", type=float, default=None, help="Held-out test fraction")
+    parser.add_argument("--seed", type=int, default=42, help="Deterministic split seed")
+    args = parser.parse_args()
+
+    print(json.dumps(train_and_report(args.features_path, holdout=args.holdout, seed=args.seed), indent=2))
+
+
+if __name__ == "__main__":
+    main()
