@@ -45,3 +45,12 @@ def from_funding_records(records: list) -> list:
         s.classify()
         signals.append(s)
     return rank_by_apr(signals)
+
+
+def estimate_flip_risk(rate_history: list[float]) -> float:
+    """Fraction of sign changes in recent rate history."""
+    if len(rate_history) < 3:
+        return 0.3
+    signs = [1 if r > 0 else -1 for r in rate_history]
+    flips = sum(1 for i in range(1, len(signs)) if signs[i] != signs[i-1])
+    return min(flips / len(signs), 1.0)
