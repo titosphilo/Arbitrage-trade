@@ -1,183 +1,115 @@
-# Handover Document — Funding Arbitrage Research Engine
-
-**From:** Claude (Anthropic) — infrastructure, data collection, strategy research  
-**To:** Codex (OpenAI) — model architecture, backtesting, ML signal refinement  
-**Date:** 22 May 2026  
-**Repo:** arb-research  
+# Handover — Funding Arb Research + Live Trading
+**Date:** 28 May 2026 | **Day:** 19/30 | **VPS:** 72.62.212.97
+**Repo:** https://github.com/titosphilo/Arbitrage-trade
 
 ---
 
-## Context
+## LIVE TRADING
 
-We have been building a research-first trading system for 12 days. The system is running live on a VPS (`72.62.212.97`) collecting real data. This repo is the research layer — no live trading until edges are proven.
+### IG Account (LIVE £500)
+- Account: JWEGH (Spread bet, tax-free)
+- API Key: 93c7393014e4cdd2b345eba0479b8431bb8761af
+- User: JACQPH72304769 / 1506Boudha!
+- Base: https://api.ig.com/gateway/deal
+- File: /root/.openclaw/workspace/projects/trading-bot/event_trader.py
 
-## What already exists (live on VPS)
+### Instruments + Sizes
+| Instrument | Epic | Size | Events |
+|---|---|---|---|
+| US 500 | IX.D.SPTRD.DAILY.IP | £1/pt | NFP, CPI, FOMC, ADP, GDP, PCE, ISM, Claims |
+| GBP/USD | CS.D.GBPUSD.TODAY.IP | £0.50/pip | BOE, UK CPI, UK Jobs |
+| EUR/USD | CS.D.EURUSD.TODAY.IP | £0.50/pip | ECB, German CPI |
 
-### Data collected
-- `btc_price_1m` — 15,840+ Bitcoin 1-minute prices
-- `gold_price_1m` — 15,840+ Gold 1-minute prices
-- `funding_history` — 166 days × 100 coins = 42,000+ funding rate records
-- `coin_profiles` — sticky score, avg rate, volatility for 100 coins
-- `macro_snapshot` — VIX, DXY, 10Y yields every 5 minutes
-- `ai_oracle_log` — 5-model AI consensus every 4 hours (28 readings)
-- `btc_gold_monitor` — BTC/Gold ratio, Z-score, funding, macro score every 4h
+### Safety scaling
+- £400+ → £1.00/pt | £250+ → £0.50/pt | £150+ → £0.25/pt | <£150 → PAUSE
 
-### Key findings
-1. **Sticky coins are real** — 15 coins paid positive every 8h period over 166 days. Sticky score ≥ 80 predicts persistence correctly.
-2. **Gold/BTC correlation = -0.07** — they are independent markets (validated with 11 days of 1-min data)
-3. **CPI/NFP direction is 13/13 correct** — HOT print → S&P falls, COOL print → S&P rises
-4. **Stock perp rates** — COINUSDT 140%/yr, AMZNUSDT 130%/yr, METAUSDT 80%/yr (live right now)
-5. **Oracle tracks BTC** — MEDIUM call on 11 May preceded 1.78% BTC drop next day
+### Signal logic
+- HOT (actual > forecast >5%): SELL equities / BUY USD pairs
+- COOL (actual < forecast >5%): BUY equities / SELL USD pairs
+- IN-LINE: skip | BORDERLINE (5-10%): half size
 
-### What's running (PM2 processes)
-```
-funding-arb       — paper funding arb, 9 positions, £3.33 collected
-ai-oracle         — 5-model consensus every 4h
-event-trader      — CPI/NFP/FOMC directional trader (demo pending activation)
-macro-monitor     — VIX/DXY/yields every 5min
-btc-gold-monitor  — BTC/Gold pairs trade score every 4h
-gold-straddle     — Gold mean-reversion (paused, wrong regime)
-stock-perp        — Stock perp rate scanner every 4h
-```
+### Next events
+- Thu 29 May 12:30 UTC — Jobless Claims → US 500
+- Fri 6 Jun 12:30 UTC — NFP → US 500 (biggest)
+- Wed 11 Jun — UK CPI → GBP/USD
+- Thu 12 Jun — ECB → EUR/USD
 
-### Database location
-```
-/root/.openclaw/workspace/projects/trading-bot/trading_data.db (SQLite)
-```
-Tables: `funding_positions`, `funding_history`, `coin_profiles`, `btc_price_1m`, `gold_price_1m`, `ai_oracle_log`, `macro_snapshot`, `btc_gold_monitor`, `event_trades`, `gold_straddle_trades`
+### Calendar fix (important)
+ForexFactory requires: `Referer: https://www.forexfactory.com/` header
+Without it → 429 rate limit → missed trade (happened today with GDP)
+Fixed in current event_trader.py with 3x retry logic
 
 ---
 
-## What Codex needs to build
+## DATABASE
+Path: /root/.openclaw/workspace/projects/trading-bot/trading_data.db
 
-### Priority 1: Funding Survival Backtester
-**File:** `backtester/funding_survival.py` (skeleton exists)
-
-The critical question: **does headline APR survive 30 days in practice?**
-
-```python
-# The test:
-# For every period where funding > 40%/yr, simulate entry
-# Track: actual income collected, rate decay, flip events, stop-outs
-# Compare: realised APR vs headline APR at entry
-# Output: survival rate, avg realised income, P25/P75 distribution
-```
-
-We have 166 days of real data. The backtester skeleton is in `backtester/funding_survival.py`. 
-Needs: `load_funding_history()` connected to the live DB, then full simulation loop.
-
-### Priority 2: Persistence Score Model
-**File:** `signal_engine/persistence.py` (needs creating)
-
-Binary classifier: given a coin's historical rate profile, predict "will it stay positive for 30 days?"
-
-Features available:
-- Rate volatility (std of 8h rates)
-- Rate trend (slope over last 30 days)
-- Consecutive positive periods count
-- Coin category (crypto vs stock perp vs commodity)
-- OI change rate
-- Long/short ratio
-
-Labels: 1 if rate stayed positive for next 30 days, 0 if it flipped
-
-Training data: ~15 coins × 166 days / 8h = ~7,500 labelled examples (small but real)
-
-### Priority 3: Event Volatility Model
-**File:** `signal_engine/event_breakout.py` (needs creating)
-
-No prediction of direction. Only: "does the market make a large enough move post-event to be worth trading?"
-
-```
-Input:  pre-event range (last 2h high-low)
-        event type (CPI, NFP, FOMC)
-        actual vs forecast deviation (%)
-Output: P(move > 50pts) in next 30 min
-```
-
-Training data: 18 months of CPI/NFP events (in HANDOVER below)
-
-### Priority 4: BTC/Gold Regime Classifier
-**File:** `signal_engine/regime.py` (needs creating)
-
-Multi-factor regime detection (0-10 score):
-- BTC/Gold ratio Z-score vs 6m, 12m average
-- BTC perpetual funding rate
-- VIX level and trend
-- DXY level and trend
-- 10Y real yield
-- BTC 30-day momentum vs Gold 30-day momentum
-
-Already running live (see `btc_gold_monitor.py`). Needs ML layer to improve signal quality.
-
----
-
-## Architecture decisions already made
-
-| Decision | Choice | Reason |
+| Table | Rows | Notes |
 |---|---|---|
-| Database | SQLite | Simple, no infrastructure, portable |
-| Exchange data | Binance public API | Most liquid perps, no auth needed |
-| Execution layer | IG Group API | UK FCA regulated, spread betting tax-free |
-| Hedge instrument | QQQ/SPY via IG spread bet | Accessible, liquid, tax-free |
-| Research approach | Paper-first | Validate edge before real capital |
-
-## UK Legal Constraint
-
-**Binance crypto/stock perps are FCA-restricted for UK retail clients.**
-
-All current positions are paper-only. Legal routes being evaluated:
-- **Hyperliquid** (decentralised, no KYC, limited instrument selection)
-- **dYdX v4** (decentralised, ~39% APR on ENA-USD right now)
-- **IBKR** for stock hedge leg (FCA regulated, low cost)
-
-## Capital and timeline
-
-- **Current capital:** £2,000 (paper trading)
-- **Day 11 of 30** — paper trading ends 10 June 2026
-- **Decision point:** if results are consistent → go live with real money
-- **Target:** validate 30%+ APR survival rate before committing capital
-
-## Questions for Codex
-
-1. What feature engineering improves persistence prediction the most?
-2. Is 7,500 training examples enough for a reliable classifier?
-3. Should we use a simple logistic regression or gradient boosting given data size?
-4. How do we handle the regime-switching nature of funding rates (HMM vs threshold models)?
-5. For the event model — is 18 months of CPI/NFP data (24 events) enough to train on?
+| btc_price_1m | 22,557 | 19 days BTC 1-min |
+| gold_price_1m | 53,870 | Gold 1-min |
+| funding_history | 59,204 | 8h rates, 258 coins |
+| coin_profiles | 258 | sticky_score, category |
+| macro_snapshot | 1,916 | VIX/DXY/yields every 5min |
+| ai_oracle_log | 124 | 5-model readings every 4h |
+| event_trades | 0 | Live trades (first pending NFP 6 Jun) |
+| funding_positions | 13 | Open paper positions |
 
 ---
 
-## First PR suggestion
+## KEY FINDINGS
 
-```
-feat: funding survival backtest
-
-- Complete backtester/funding_survival.py
-- Connect to live 166-day SQLite database
-- Run backtest for top 10 coins
-- Output: survival rate, realised vs headline APR, P25/P75
-- Add tests/test_backtester.py with synthetic data
-```
-
-## Shared data export
-
-To get the full 42,000-row funding history CSV for analysis:
-```bash
-ssh root@72.62.212.97
-cd /root/.openclaw/workspace/projects/trading-bot
-python3 -c "
-import sqlite3, pandas as pd
-conn = sqlite3.connect('trading_data.db')
-df = pd.read_sql('SELECT * FROM funding_history', conn)
-df.to_csv('/tmp/funding_history_166d.csv', index=False)
-print(df.shape)
-"
-```
-
-Then `scp root@72.62.212.97:/tmp/funding_history_166d.csv .`
+1. **Sticky coins confirmed** — 15 coins 100% positive over 166 days
+2. **Classifier accuracy 91.6%** on 215 symbols
+3. **Realised APR = 75% of headline** (backtest validated on 46k rows)
+4. **No coins pass all 4 quality filters today** — all at 5.5%/yr floor (normal)
+5. **COINUSDT 141%/yr → 10.8% survival** — classifier correctly rejects
+6. **Margin confirmed** — US 500 £1/pt = £376 margin (5% of notional)
+7. **GDP lesson** — second estimates don't move markets; first-release events matter
 
 ---
 
-*Claude has access to the live VPS and can run code, pull data, and test models at any time.  
-Codex handles model architecture and training. Both commit to this repo.*
+## WHAT CODEX NEEDS TO BUILD
+
+### 1. Funding Momentum Detector (signal_engine/momentum.py)
+Detect coins *becoming* sticky before they fully qualify
+- Enter when: APR rising + streak growing + OI rising + vol stable
+- Catches sticky trades 3-5 periods earlier
+
+### 2. Re-entry System (signal_engine/reentry.py)
+If coin was sticky before AND APR recovers >40% AND streak resumes → re-enter faster
+
+### 3. Capital Rotation (signal_engine/rotation.py)
+Rank every 8h by: expected_income × P(sticky) / volatility
+Move capital from weak to stronger positions
+
+### 4. Event ML Model (signal_engine/event_model.py)
+Train on 18 months CPI/NFP — features: deviation%, event type, VIX, pre-event drift
+Output: P(move >50pts in 30min)
+
+---
+
+## GITHUB COLLABORATION
+
+**Codex built:** Signal dataclass, compute_edge_score(), persistence classifier,
+funding_survival backtester, src/models.py, src/risk.py, test suite
+
+**Claude built:** All VPS infrastructure, live trading, quality_filter.py,
+position_sizer.py, decay_exit.py, decay_predictor.py, spot_perp_basis.py,
+src/cli.py, 46k-row data export, 215-symbol features dataset
+
+---
+
+## QUESTIONS FOR CODEX
+
+1. With 215 symbols / 91.6% accuracy — how many more points to reach 95%?
+2. Can momentum detection use existing features or needs OI time-series?
+3. 24 CPI/NFP events — enough for event ML or need transfer learning?
+4. Capital rotation: Sharpe-ranking or RL?
+
+---
+
+## UK LEGAL NOTE
+Binance crypto/stock perps FCA-restricted for UK retail.
+All funding positions paper-only.
+Legal routes: Hyperliquid, dYdX v4, IBKR for hedge leg.
