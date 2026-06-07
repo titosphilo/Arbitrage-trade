@@ -82,5 +82,64 @@ def rank_edges(
     return sorted(ranked, key=lambda edge: edge.edge_score, reverse=True)
 
 
+def compute_score(
+    *,
+    ann_pct: float,
+    persistence: float,
+    volume_usd: float,
+    oi_usd: float,
+    ls_ratio: float,
+    flip_risk: float,
+) -> float:
+    """Compatibility score for the original scanner API (0-100)."""
+    apr_score = clamp((ann_pct - 15.0) / 65.0, 0.0, 1.0) * 35
+    persistence_score = clamp(persistence, 0.0, 1.0) * 30
+    volume_score = clamp(volume_usd / 5_000_000, 0.0, 1.0) * 15
+    oi_score = clamp(oi_usd / 2_000_000, 0.0, 1.0) * 10
+    crowding_score = clamp((ls_ratio - 1.0) / 1.0, 0.0, 1.0) * 10
+    flip_penalty = clamp(flip_risk, 0.0, 1.0) * 20
+    return round(
+        clamp(
+            apr_score
+            + persistence_score
+            + volume_score
+            + oi_score
+            + crowding_score
+            - flip_penalty,
+            0.0,
+            100.0,
+        ),
+        2,
+    )
+
+
+def classify(score: float, ann_pct: float) -> str:
+    """Compatibility classifier used by the original scanner and tests."""
+    if ann_pct < 15:
+        return "EXIT"
+    if ann_pct >= 40 and score >= 70:
+        return "ENTER"
+    if score >= 45:
+        return "WATCH"
+    return "SKIP"
+
+
+def estimate_flip_risk(history: list[float]) -> float:
+    """Estimate sign-flip risk from a sequence of funding observations."""
+    if len(history) < 2:
+        return 0.5
+    nonzero = [value for value in history if value != 0]
+    if len(nonzero) < 2:
+        return 0.5
+    sign_changes = sum(
+        1
+        for previous, current in zip(nonzero, nonzero[1:])
+        if (previous > 0) != (current > 0)
+    )
+    change_rate = sign_changes / (len(nonzero) - 1)
+    negative_share = sum(value < 0 for value in nonzero) / len(nonzero)
+    return round(clamp(change_rate * 0.8 + negative_share * 0.2, 0.0, 1.0), 4)
+
+
 def clamp(value: float, lower: float, upper: float) -> float:
     return min(max(value, lower), upper)
