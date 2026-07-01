@@ -46,9 +46,9 @@ class DailyOpportunity:
 
 def score_daily_opportunity(snapshot: DailySnapshot) -> DailyOpportunity:
     momentum_pressure = clamp(
-        abs(snapshot.overnight_return) * 8
-        + snapshot.intraday_range_pct * 4
-        + max(snapshot.price_confirmation, 0.0) * 0.35,
+        abs(snapshot.overnight_return) * 20
+        + snapshot.intraday_range_pct * 10
+        + max(snapshot.price_confirmation, 0.0) * 0.40,
         0.0,
         1.0,
     )
@@ -72,7 +72,7 @@ def score_daily_opportunity(snapshot: DailySnapshot) -> DailyOpportunity:
         0.0,
         1.0,
     )
-    vol_penalty = clamp(snapshot.realized_volatility / 0.04, 0.0, 1.0) * 0.25
+    vol_penalty = clamp(snapshot.realized_volatility / 0.04, 0.0, 1.0) * 0.18
     liquidity_penalty = (1.0 - clamp(snapshot.liquidity_score, 0.0, 1.0)) * 0.35
 
     setup = choose_setup(snapshot, momentum_pressure, funding_pressure)
@@ -87,21 +87,21 @@ def score_daily_opportunity(snapshot: DailySnapshot) -> DailyOpportunity:
             reasons=("no daily edge is dominant",),
         )
 
+    setup_pressure = max(momentum_pressure, funding_pressure)
     raw_score = (
-        momentum_pressure * 0.30
-        + macro_pressure * 0.15
+        setup_pressure * 0.45
         + psychology_pressure * 0.25
-        + funding_pressure * 0.20
-        + clamp(snapshot.price_confirmation, 0.0, 1.0) * 0.10
+        + macro_pressure * 0.15
+        + clamp(snapshot.price_confirmation, 0.0, 1.0) * 0.15
         - vol_penalty
         - liquidity_penalty
     )
     score = clamp(raw_score, 0.0, 1.0)
     reasons = explain(snapshot, setup, momentum_pressure, funding_pressure, macro_pressure)
 
-    if score >= 0.68 and snapshot.price_confirmation >= 0.45 and snapshot.liquidity_score >= 0.60:
+    if score >= 0.50 and snapshot.price_confirmation >= 0.45 and snapshot.liquidity_score >= 0.60:
         permission = "TRADE"
-    elif score >= 0.48:
+    elif score >= 0.42:
         permission = "WATCH"
     else:
         permission = "SKIP"
