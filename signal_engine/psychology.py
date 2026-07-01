@@ -94,7 +94,7 @@ def score_event(event: PsychologyEvent) -> PsychologyScore:
         reasons.append("surprise is too small")
     if confirmation < 0.15:
         reasons.append("price action has not confirmed the psychological read")
-    if conviction >= 0.70:
+    if conviction >= 0.60 and surprise_magnitude >= 0.10 and confirmation >= 0.50:
         permission = "TRADE"
     elif conviction >= 0.50:
         permission = "WATCH"
